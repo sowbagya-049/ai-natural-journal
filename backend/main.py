@@ -1,20 +1,29 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
 from collections import Counter
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import json
 
 import models
 from database import engine, get_db
 from models import JournalEntryModel
-from llm_service import analyze_journal_text
+from llm_service import analyze_journal_text, analyze_journal_stream
 
 # Create database tables
 models.Base.metadata.create_all(bind=engine)
 
+# ── Rate Limiter ─────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address, default_limits=["60/minute"])
+
 app = FastAPI(title="AI Journal API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Allow frontend to call the backend locally
 app.add_middleware(
@@ -27,7 +36,8 @@ app.add_middleware(
 
 
 @app.post("/api/journal", response_model=models.JournalResponse)
-def create_journal_entry(entry: models.JournalCreate, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def create_journal_entry(request: Request, entry: models.JournalCreate, db: Session = Depends(get_db)):
     db_entry = JournalEntryModel(
         userId=entry.userId,
         ambience=entry.ambience,
@@ -53,7 +63,8 @@ def create_journal_entry(entry: models.JournalCreate, db: Session = Depends(get_
     )
 
 @app.get("/api/journal/{userId}", response_model=List[models.JournalResponse])
-def get_user_entries(userId: str, db: Session = Depends(get_db)):
+@limiter.limit("60/minute")
+def get_user_entries(request: Request, userId: str, db: Session = Depends(get_db)):
     entries = db.query(JournalEntryModel).filter(JournalEntryModel.userId == userId).all()
     
     result = []
@@ -73,13 +84,15 @@ def get_user_entries(userId: str, db: Session = Depends(get_db)):
     return result
 
 @app.post("/api/journal/analyze")
-def analyze_journal(request: models.JournalAnalyzeRequest, db: Session = Depends(get_db)):
-    # Pass to LLM Service for actual analysis
-    analysis_result = analyze_journal_text(request.text)
+@limiter.limit("10/minute")
+def analyze_journal(request: Request, body: models.JournalAnalyzeRequest, db: Session = Depends(get_db)):
+    """Standard (non-streaming) analysis — results cached in memory by content hash."""
+    # Pass to LLM Service for actual analysis (cache handled inside llm_service)
+    analysis_result = analyze_journal_text(body.text)
     
     # Save the analysis back to the DB so insights can render it
-    if request.id:
-        db_entry = db.query(JournalEntryModel).filter(JournalEntryModel.id == request.id).first()
+    if body.id:
+        db_entry = db.query(JournalEntryModel).filter(JournalEntryModel.id == body.id).first()
         if db_entry:
             db_entry.emotion = analysis_result.get("emotion")
             db_entry.keywords = ",".join(analysis_result.get("keywords", []))
@@ -89,8 +102,55 @@ def analyze_journal(request: models.JournalAnalyzeRequest, db: Session = Depends
     return analysis_result
 
 
+@app.post("/api/journal/analyze/stream")
+@limiter.limit("10/minute")
+async def analyze_journal_streaming(request: Request, body: models.JournalAnalyzeRequest, db: Session = Depends(get_db)):
+    """
+    Streaming analysis endpoint — returns tokens as Server-Sent Events.
+    The frontend can consume this with the EventSource API or fetch + ReadableStream.
+    After streaming is complete the assembled result is also persisted to the DB.
+    """
+    async def event_generator():
+        assembled_chunks = []
+        async for sse_line in analyze_journal_stream(body.text):
+            assembled_chunks.append(sse_line)
+            yield sse_line
+
+        # Try to persist the final assembled JSON to DB
+        if body.id:
+            full_data = "".join(assembled_chunks)
+            for line in full_data.splitlines():
+                if line.startswith("data:") and "[DONE]" not in line:
+                    raw = line[5:].strip()
+                    try:
+                        payload = json.loads(raw)
+                        # If it's a {chunk: ...} wrapper skip it; look for full result
+                        if "emotion" in payload:
+                            db_entry = db.query(JournalEntryModel).filter(
+                                JournalEntryModel.id == body.id
+                            ).first()
+                            if db_entry:
+                                db_entry.emotion = payload.get("emotion")
+                                db_entry.keywords = ",".join(payload.get("keywords", []))
+                                db_entry.summary = payload.get("summary")
+                                db.commit()
+                            break
+                    except Exception:
+                        pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/api/journal/insights/{userId}", response_model=models.InsightsResponse)
-def get_user_insights(userId: str, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def get_user_insights(request: Request, userId: str, db: Session = Depends(get_db)):
     entries = db.query(JournalEntryModel).filter(JournalEntryModel.userId == userId).all()
     
     total_entries = len(entries)

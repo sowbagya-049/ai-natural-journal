@@ -6,10 +6,10 @@ export default function JournalList({ entries, onAnalyzeSuccess }) {
 
   const handleAnalyze = async (entry) => {
     setAnalyzingId(entry.id);
-    setAnalysisResult(null); // Clear previous
+    setAnalysisResult({ id: entry.id, emotion: 'Analyzing...', keywords: [], summary: '' });
     
     try {
-      const response = await fetch('http://localhost:8000/api/journal/analyze', {
+      const response = await fetch('http://localhost:8000/api/journal/analyze/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -18,13 +18,51 @@ export default function JournalList({ entries, onAnalyzeSuccess }) {
         }),
       });
 
-      if (response.ok) {
-        const data = await response.json();
-        setAnalysisResult({ id: entry.id, ...data });
-        if (onAnalyzeSuccess) onAnalyzeSuccess();
+      if (!response.ok) throw new Error('Network response was not ok');
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulatedText = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim();
+            if (dataStr === '[DONE]') break;
+
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.chunk) {
+                accumulatedText += data.chunk;
+                // Try to extract summary from accumulating JSON string
+                const summaryMatch = accumulatedText.match(/"summary":\s*"([^"]*)/);
+                const emotionMatch = accumulatedText.match(/"emotion":\s*"([^"]*)/);
+                
+                setAnalysisResult(prev => ({
+                    ...prev,
+                    summary: summaryMatch ? summaryMatch[1] : prev.summary,
+                    emotion: emotionMatch ? emotionMatch[1] : prev.emotion
+                }));
+              } else if (data.emotion) {
+                // Final full object received
+                setAnalysisResult({ id: entry.id, ...data });
+                if (onAnalyzeSuccess) onAnalyzeSuccess();
+              }
+            } catch (e) {
+              // Ignore partial JSON parse errors
+            }
+          }
+        }
       }
     } catch (error) {
       console.error('Failed to analyze entry:', error);
+      setAnalysisResult(null);
     } finally {
       setAnalyzingId(null);
     }

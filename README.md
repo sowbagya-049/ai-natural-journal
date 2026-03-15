@@ -6,15 +6,19 @@ A full-stack application that allows users to write journal entries after nature
 
 - **Write Journal Entries:** Log your thoughts and the natural ambience (forest, ocean, rain, etc.)
 - **View Past Entries:** See all your previous logs organized neatly.
-- **AI Analysis:** Click "Analyze" on any entry to extract the primary emotion, keywords, and a short summary using **Google Gemini 1.5 Flash**.
+- **AI Analysis:** Click "Analyze" on any entry to extract the primary emotion, keywords, and a short summary using **Google Gemini 2.5 Flash**.
 - **Insights Dashboard:** View aggregated stats including total entries, most common emotion, top ambience, and recent keywords.
+- **Streaming Analysis:** Real-time token streaming via SSE (`/api/journal/analyze/stream`)
+- **Caching:** Analysis results are cached in-memory (SHA-256 keyed) to avoid redundant LLM calls.
+- **Rate Limiting:** All endpoints are protected by `slowapi` (10 req/min on analyze, 60 req/min global).
 
 ## Tech Stack
 
-- **Frontend:** React (powered by Vite) + Vanilla CSS (Modern glassmorphism UI)
-- **Backend:** Python + FastAPI
+- **Frontend:** React (Vite) + Vanilla CSS (Glassmorphism UI)
+- **Backend:** Python + FastAPI + slowapi + sse-starlette
 - **Database:** SQLite (via SQLAlchemy)
-- **AI Integration:** Google Generative AI SDK (Gemini API)
+- **AI:** Google Generative AI SDK (Gemini 2.5 Flash)
+- **Container:** Docker + Docker Compose
 
 ## Project Structure
 
@@ -22,77 +26,103 @@ A full-stack application that allows users to write journal entries after nature
 ai-journal-system/
 ├── backend/
 │   ├── database.py       # SQLite connection & session
-│   ├── llm_service.py    # Gemini API wrapper
-│   ├── main.py           # FastAPI endpoints
+│   ├── llm_service.py    # Gemini API wrapper (caching + streaming)
+│   ├── main.py           # FastAPI endpoints + rate limiting
 │   ├── models.py         # SQLAlchemy and Pydantic schemas
-│   └── requirements.txt  # Python dependencies
+│   ├── requirements.txt  # Python dependencies
+│   └── Dockerfile
 ├── frontend/             # Vite + React app
 │   ├── src/
 │   │   ├── components/   # UI generic components
 │   │   ├── App.jsx       # Main layout and state
 │   │   └── index.css     # Global styles
-│   └── package.json
-├── README.md             # This file
-└── ARCHITECTURE.md       # Architectural scaling answers
+│   ├── package.json
+│   └── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── README.md
+└── ARCHITECTURE.md
 ```
 
 ## How to Run
 
-### 1. Backend Setup
+### Option A — Docker (recommended)
 
-1. Navigate to the backend folder:
-   ```bash
-   cd backend
-   ```
-2. Create and activate a virtual environment (optional but recommended):
-   ```bash
-   python -m venv venv
-   # On Windows: venv\Scripts\activate
-   # On Mac/Linux: source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Set up your `.env` file or environment variable with your Gemini API Key in the `backend/` directory:
-   ```
-   GEMINI_API_KEY=your_google_gemini_api_key_here
-   ```
-5. Run the server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-   *The API will be available at `http://localhost:8000`.*
+```bash
+# 1. Copy env file and add your key
+cp .env.example .env
+# Edit .env → set GEMINI_API_KEY=your_key_here
 
-### 2. Frontend Setup
+# 2. Build and start all services
+docker compose up --build
 
-1. Open a new terminal and navigate to the frontend folder:
-   ```bash
-   cd frontend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Start the development server:
-   ```bash
-   npm run dev
-   ```
-4. Open the displayed local URL (typically `http://localhost:5173`) in your browser.
+# App: http://localhost
+# API: http://localhost:8000
+# Docs: http://localhost:8000/docs
+```
+
+### Option B — Local Development
+
+#### 1. Backend Setup
+
+```bash
+cd backend
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Mac/Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+Create `backend/.env`:
+```
+GEMINI_API_KEY=your_google_gemini_api_key_here
+```
+
+```bash
+uvicorn main:app --reload
+# API at http://localhost:8000
+```
+
+#### 2. Frontend Setup
+
+```bash
+cd frontend
+npm install
+npm run dev
+# App at http://localhost:5173
+```
 
 ## API Endpoints
 
-### `POST /api/journal`
-Creates a new journal entry.
-**Body:** `{ "userId": "string", "ambience": "string", "text": "string" }`
+| Method | Endpoint | Description | Rate Limit |
+|--------|----------|-------------|------------|
+| `POST` | `/api/journal` | Create a new journal entry | 30/min |
+| `GET`  | `/api/journal/{userId}` | Get all entries for a user | 60/min |
+| `POST` | `/api/journal/analyze` | Analyze entry with Gemini (cached) | 10/min |
+| `POST` | `/api/journal/analyze/stream` | Stream analysis as SSE tokens | 10/min |
+| `GET`  | `/api/journal/insights/{userId}` | Aggregated user stats | 30/min |
 
-### `GET /api/journal/{userId}`
-Gets all journal entries for a specific user.
+### Streaming Example (JavaScript)
 
-### `POST /api/journal/analyze`
-Sends the text to the Gemini API and returns insights.
-**Body:** `{ "text": "string" }`
-**Returns:** `{ "emotion": "string", "keywords": [...], "summary": "string" }`
+```js
+const response = await fetch('/api/journal/analyze/stream', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ text: 'Today I walked through the misty forest...' })
+});
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  console.log(decoder.decode(value)); // SSE chunks
+}
+```
 
-### `GET /api/journal/insights/{userId}`
-Returns aggregated statistics for the user's dashboard.
+## Deployment
+
+- **Frontend:** Deploy `frontend/` to **Vercel** (set `VITE_API_URL` to your backend URL)
+- **Backend:** Deploy `backend/` to **Render** (set `GEMINI_API_KEY` env var in Render dashboard)

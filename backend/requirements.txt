@@ -4,3 +4,5 @@ pydantic
 sqlalchemy
 google-generativeai
 python-dotenv
+slowapi
+sse-starlette
